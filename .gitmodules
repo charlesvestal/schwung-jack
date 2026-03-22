@@ -1,0 +1,3 @@
+[submodule "linux/move/move-spi"]
+	path = linux/move/move-spi
+	url = git@github.com:AbletonAppDev/move-spi.git
