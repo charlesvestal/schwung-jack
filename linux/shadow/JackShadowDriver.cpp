@@ -1,27 +1,13 @@
 /*
-Copyright (C) 2001 Paul Davis
-Copyright (C) 2004 Grame
-Copyright (C) 2025 Cycling '74 - Adapted for Move
-Copyright (C) 2026 Schwung - Shadow driver (shared memory + futex)
+Copyright (C) 2026 Charles Vestal
+License: MIT
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
-
+JackShadowDriver — JACK audio driver that shares audio/MIDI/display with
+Move's firmware via shared memory (/dev/shm/schwung_jack).
+Based on JackMoveDriver by Cycling '74 (GPL-2.0).
 */
 
-#define __STDC_FORMAT_MACROS   // For inttypes.h to work in C++
-
+#define __STDC_FORMAT_MACROS
 #include <iostream>
 #include <math.h>
 #include <stdio.h>
@@ -58,49 +44,39 @@ Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 namespace Jack
 {
 
-const char * SHADOW_DISPLAY_HEADER = "MOVEDISP";
-const size_t SHADOW_DISPLAY_HEADER_LEN = 8;
-const size_t SHADOW_DISPLAY_DATA_LEN = SHADOW_DISPLAY_HEADER_LEN + SCHWUNG_JACK_DISPLAY_SIZE;
+static const char * DISPLAY_HEADER = "MOVEDISP";
+static const size_t DISPLAY_HEADER_LEN = 8;
+static const size_t DISPLAY_DATA_LEN = DISPLAY_HEADER_LEN + SCHWUNG_JACK_DISPLAY_SIZE;
 
-namespace {
-  const jack_default_audio_sample_t mul = std::min(static_cast<jack_default_audio_sample_t>(std::numeric_limits<int16_t>::max()), static_cast<jack_default_audio_sample_t>(std::abs(std::numeric_limits<int16_t>::min())));
+static const jack_default_audio_sample_t mul =
+    std::min(static_cast<jack_default_audio_sample_t>(std::numeric_limits<int16_t>::max()),
+             static_cast<jack_default_audio_sample_t>(std::abs(std::numeric_limits<int16_t>::min())));
 
-  inline jack_default_audio_sample_t clamp(jack_default_audio_sample_t v, jack_default_audio_sample_t min, jack_default_audio_sample_t max) {
-    if (v < min)
-      return min;
-    if (v > max)
-      return max;
-    return v;
-  }
-
-  inline int16_t toint(jack_default_audio_sample_t v) {
-    return static_cast<int16_t>(clamp(v, -1.0, 1.0) * mul);
-  }
-
-  inline jack_default_audio_sample_t fromint(int16_t v) {
-    return static_cast<jack_default_audio_sample_t>(v) / mul;
-  }
-
-  static int futex_wait(uint32_t* addr, uint32_t val, const struct timespec* timeout) {
-    return syscall(SYS_futex, addr, FUTEX_WAIT, val, timeout, NULL, 0);
-  }
+static inline int16_t toint(jack_default_audio_sample_t v) {
+    if (v < -1.0f) v = -1.0f;
+    if (v >  1.0f) v =  1.0f;
+    return static_cast<int16_t>(v * mul);
 }
 
-int JackShadowDriver::Open(jack_nframes_t nframes,
-    jack_nframes_t samplerate,
-    bool capturing,
-    bool playing,
-    int inchannels,
-    int outchannels,
-    bool monitor,
-    const char* capture_driver_name,
+static inline jack_default_audio_sample_t fromint(int16_t v) {
+    return static_cast<jack_default_audio_sample_t>(v) / mul;
+}
+
+static inline void futex_wait(uint32_t *addr, uint32_t expected, const struct timespec *timeout) {
+    syscall(SYS_futex, addr, FUTEX_WAIT, expected, timeout, NULL, 0);
+}
+
+/* ---- Open / Close ---- */
+
+int JackShadowDriver::Open(jack_nframes_t nframes, jack_nframes_t samplerate,
+    bool capturing, bool playing, int inchannels, int outchannels,
+    bool monitor, const char* capture_driver_name,
     const char* playback_driver_name,
-    jack_nframes_t capture_latency,
-    jack_nframes_t playback_latency)
+    jack_nframes_t capture_latency, jack_nframes_t playback_latency)
 {
-    // Generic JackAudioDriver Open
     if (JackAudioDriver::Open(nframes, samplerate, capturing, playing,
-                              inchannels, outchannels, monitor, capture_driver_name, playback_driver_name,
+                              inchannels, outchannels, monitor,
+                              capture_driver_name, playback_driver_name,
                               capture_latency, playback_latency) != 0) {
         return -1;
     }
@@ -118,34 +94,38 @@ int JackShadowDriver::Attach() {
     jack_port_id_t port_index;
     char name[REAL_JACK_PORT_NAME_SIZE+1];
     char alias[REAL_JACK_PORT_NAME_SIZE+1];
-    int i;
 
-    jack_log("JackShadowDriver::Attach fBufferSize = %ld fSampleRate = %ld", fEngineControl->fBufferSize, fEngineControl->fSampleRate);
+    jack_log("JackShadowDriver::Attach fBufferSize = %ld fSampleRate = %ld",
+             fEngineControl->fBufferSize, fEngineControl->fSampleRate);
 
-    for (i = 0; i < fCaptureChannels; i++) {
-        snprintf(alias, sizeof(alias), "shadow:out%d", i + 1);
+    /* Audio capture ports */
+    for (int i = 0; i < fCaptureChannels; i++) {
+        snprintf(alias, sizeof(alias), "move:out%d", i + 1);
         snprintf(name, sizeof(name), "%s:capture_%d", fClientControl.fName, i + 1);
-        if (fEngine->PortRegister(fClientControl.fRefNum, name, JACK_DEFAULT_AUDIO_TYPE, CaptureDriverFlags, fEngineControl->fBufferSize, &port_index) < 0) {
+        if (fEngine->PortRegister(fClientControl.fRefNum, name,
+                JACK_DEFAULT_AUDIO_TYPE, CaptureDriverFlags,
+                fEngineControl->fBufferSize, &port_index) < 0) {
             jack_error("driver: cannot register port for %s", name);
             return -1;
         }
         port = fGraphManager->GetPort(port_index);
         port->SetAlias(alias);
         fCapturePortList[i] = port_index;
-        jack_log("JackShadowDriver::Attach fCapturePortList[i] port_index = %ld", port_index);
     }
 
-    for (i = 0; i < fPlaybackChannels; i++) {
-        snprintf(alias, sizeof(alias), "shadow:in%d", i + 1);
+    /* Audio playback ports */
+    for (int i = 0; i < fPlaybackChannels; i++) {
+        snprintf(alias, sizeof(alias), "move:in%d", i + 1);
         snprintf(name, sizeof(name), "%s:playback_%d", fClientControl.fName, i + 1);
-        if (fEngine->PortRegister(fClientControl.fRefNum, name, JACK_DEFAULT_AUDIO_TYPE, PlaybackDriverFlags, fEngineControl->fBufferSize, &port_index) < 0) {
+        if (fEngine->PortRegister(fClientControl.fRefNum, name,
+                JACK_DEFAULT_AUDIO_TYPE, PlaybackDriverFlags,
+                fEngineControl->fBufferSize, &port_index) < 0) {
             jack_error("driver: cannot register port for %s", name);
             return -1;
         }
         port = fGraphManager->GetPort(port_index);
         port->SetAlias(alias);
         fPlaybackPortList[i] = port_index;
-        jack_log("JackShadowDriver::Attach fPlaybackPortList[i] port_index = %ld", port_index);
     }
 
     jack_nframes_t latency = SCHWUNG_JACK_AUDIO_FRAMES;
@@ -153,111 +133,69 @@ int JackShadowDriver::Attach() {
     latency_range.max = latency;
     latency_range.min = latency;
 
-    // register MIDI
+    /* MIDI ports */
     {
-      auto buf = "system:midi_playback";
-      if (fEngine->PortRegister(fClientControl.fRefNum, buf,
-            JACK_DEFAULT_MIDI_TYPE,
-            PlaybackDriverFlags,
-            fEngineControl->fBufferSize, &fMIDIPlaybackId) < 0) {
-        jack_error("driver: cannot register port for %s", buf);
-        return -1;
-      }
-      port = fGraphManager->GetPort(fMIDIPlaybackId);
-      port->SetLatencyRange(JackPlaybackLatency, &latency_range);
+        if (fEngine->PortRegister(fClientControl.fRefNum, "system:midi_playback",
+                JACK_DEFAULT_MIDI_TYPE, PlaybackDriverFlags,
+                fEngineControl->fBufferSize, &fMIDIPlaybackId) < 0) return -1;
+        fGraphManager->GetPort(fMIDIPlaybackId)->SetLatencyRange(JackPlaybackLatency, &latency_range);
     }
     {
-      auto buf = "system:midi_capture";
-      if (fEngine->PortRegister(fClientControl.fRefNum, buf,
-            JACK_DEFAULT_MIDI_TYPE,
-            CaptureDriverFlags,
-            fEngineControl->fBufferSize, &fMIDICaptureId) < 0) {
-        jack_error("driver: cannot register port for %s", buf);
-        return -1;
-      }
-      port = fGraphManager->GetPort(fMIDICaptureId);
-      port->SetLatencyRange(JackCaptureLatency, &latency_range);
-    }
-
-    //external midi i/o
-    {
-      auto buf = "system:midi_playback_ext";
-      if (fEngine->PortRegister(fClientControl.fRefNum, buf,
-            JACK_DEFAULT_MIDI_TYPE,
-            PlaybackDriverFlags,
-            fEngineControl->fBufferSize, &fExternalMIDIPlaybackId) < 0) {
-        jack_error("driver: cannot register port for %s", buf);
-        return -1;
-      }
-      port = fGraphManager->GetPort(fExternalMIDIPlaybackId);
-      port->SetLatencyRange(JackPlaybackLatency, &latency_range);
+        if (fEngine->PortRegister(fClientControl.fRefNum, "system:midi_capture",
+                JACK_DEFAULT_MIDI_TYPE, CaptureDriverFlags,
+                fEngineControl->fBufferSize, &fMIDICaptureId) < 0) return -1;
+        fGraphManager->GetPort(fMIDICaptureId)->SetLatencyRange(JackCaptureLatency, &latency_range);
     }
     {
-      auto buf = "system:midi_capture_ext";
-      if (fEngine->PortRegister(fClientControl.fRefNum, buf,
-            JACK_DEFAULT_MIDI_TYPE,
-            CaptureDriverFlags,
-            fEngineControl->fBufferSize, &fExternalMIDICaptureId) < 0) {
-        jack_error("driver: cannot register port for %s", buf);
-        return -1;
-      }
-      port = fGraphManager->GetPort(fExternalMIDICaptureId);
-      port->SetLatencyRange(JackCaptureLatency, &latency_range);
+        if (fEngine->PortRegister(fClientControl.fRefNum, "system:midi_playback_ext",
+                JACK_DEFAULT_MIDI_TYPE, PlaybackDriverFlags,
+                fEngineControl->fBufferSize, &fExternalMIDIPlaybackId) < 0) return -1;
+        fGraphManager->GetPort(fExternalMIDIPlaybackId)->SetLatencyRange(JackPlaybackLatency, &latency_range);
     }
-
-    // register display
     {
-      auto buf = "system:display";
-      if (fEngine->PortRegister(fClientControl.fRefNum, buf,
-            JACK_DEFAULT_MIDI_TYPE,
-            PlaybackDriverFlags,
-            fEngineControl->fBufferSize, &fDisplayId) < 0) {
-        jack_error("driver: cannot register port for %s", buf);
-        return -1;
-      }
+        if (fEngine->PortRegister(fClientControl.fRefNum, "system:midi_capture_ext",
+                JACK_DEFAULT_MIDI_TYPE, CaptureDriverFlags,
+                fEngineControl->fBufferSize, &fExternalMIDICaptureId) < 0) return -1;
+        fGraphManager->GetPort(fExternalMIDICaptureId)->SetLatencyRange(JackCaptureLatency, &latency_range);
+    }
+    {
+        if (fEngine->PortRegister(fClientControl.fRefNum, "system:display",
+                JACK_DEFAULT_MIDI_TYPE, PlaybackDriverFlags,
+                fEngineControl->fBufferSize, &fDisplayId) < 0) return -1;
     }
 
     UpdateLatencies();
 
-    // Open shared memory
+    /* Open shared memory */
     int fd = shm_open(SCHWUNG_JACK_SHM_PATH, O_RDWR, 0666);
     if (fd < 0) {
-        jack_error("JackShadowDriver::Attach: shm_open(%s) failed: %s", SCHWUNG_JACK_SHM_PATH, strerror(errno));
+        jack_error("JackShadowDriver::Attach: shm_open(%s) failed: %s",
+                   SCHWUNG_JACK_SHM_PATH, strerror(errno));
         return -1;
     }
-
-    void* ptr = mmap(NULL, SCHWUNG_JACK_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    fShm = (SchwungJackShm *)mmap(NULL, SCHWUNG_JACK_SHM_SIZE,
+                                   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-
-    if (ptr == MAP_FAILED) {
-        jack_error("JackShadowDriver::Attach: mmap failed: %s", strerror(errno));
-        return -1;
-    }
-
-    fShm = reinterpret_cast<SchwungJackShm*>(ptr);
-
-    if (fShm->magic != SCHWUNG_JACK_MAGIC) {
-        jack_error("JackShadowDriver::Attach: bad magic 0x%08x (expected 0x%08x)", fShm->magic, SCHWUNG_JACK_MAGIC);
-        munmap(fShm, SCHWUNG_JACK_SHM_SIZE);
+    if (fShm == MAP_FAILED) {
+        jack_error("JackShadowDriver: mmap failed");
         fShm = NULL;
         return -1;
     }
-
-    if (fShm->version != SCHWUNG_JACK_VERSION) {
-        jack_error("JackShadowDriver::Attach: version mismatch %u (expected %u)", fShm->version, SCHWUNG_JACK_VERSION);
+    if (fShm->magic != SCHWUNG_JACK_MAGIC || fShm->version != SCHWUNG_JACK_VERSION) {
+        jack_error("JackShadowDriver: bad magic/version (got 0x%x v%d)",
+                   fShm->magic, fShm->version);
         munmap(fShm, SCHWUNG_JACK_SHM_SIZE);
         fShm = NULL;
         return -1;
     }
 
     fLastFrameCounter = fShm->frame_counter;
-    jack_log("JackShadowDriver::Attach: shared memory attached successfully");
+    jack_info("JackShadowDriver: attached to shared memory, frame_counter=%u", fLastFrameCounter);
 
     return 0;
 }
 
-int JackShadowDriver::Close()
-{
+int JackShadowDriver::Close() {
     if (fShm) {
         munmap(fShm, SCHWUNG_JACK_SHM_SIZE);
         fShm = NULL;
@@ -265,127 +203,266 @@ int JackShadowDriver::Close()
     return JackAudioDriver::Close();
 }
 
+/* ---- Process ----
+ * Matches JackMoveDriver::Process() pattern:
+ * 1. Drain MIDI queues from previous cycle → write to shm
+ * 2. Read audio output from previous cycle → write to shm
+ * 3. Block until next frame (futex wait)
+ * 4. Run the JACK graph (Read → client processing → Write)
+ *
+ * Key insight: Write() enqueues MIDI to async queues. Process() drains
+ * those queues to shm BEFORE blocking. This matches how JackMoveDriver
+ * uses provideMidi() inside ablspiSendAndReceiveAudioAndMidi().
+ */
 int JackShadowDriver::Process()
 {
-    // Wait for the shim to signal a new frame via futex
+    if (!fShm) return -1;
+
+    /* Drain MIDI playback queues → shm (from previous cycle's Write()).
+     * Uses the same encoding logic as JackMoveDriver::provideMidi():
+     * - Channel 16 messages → rewrite to channel 0
+     * - Sysex messages → fragment into 3-byte USB-MIDI packets with proper CIN
+     * - System messages (reset, sysex start/end) → pass through */
+    {
+        jack_midi_event_t *first = fMIDIReadQueue.DequeueEvent();
+        if (first) {
+            int count = 0;
+            bool sysexActive = false;
+
+            /* Process first event, then drain rest */
+            jack_midi_event_t *e = first;
+            do {
+                if (!e || e->size == 0) continue;
+                if (count >= SCHWUNG_JACK_MIDI_OUT_MAX) break;
+
+                uint8_t *data = e->buffer;
+                size_t size = e->size;
+                uint8_t status = data[0];
+                uint8_t chan = status & 0x0F;
+                uint8_t masked = status & 0xF0;
+
+                /* Filter: only pass ch16, sysex, and system messages */
+                if ((masked == 0x80 || masked == 0x90 || masked == 0xB0)) {
+                    if (chan != 15) continue; /* skip non-ch16 */
+                    data[0] = masked; /* rewrite to channel 0 */
+                } else if (status == 0xFF || status == 0xF0 || status == 0xF7 || (status & 0x80) == 0) {
+                    /* sysex, reset, continuation — pass through */
+                } else {
+                    continue; /* skip other messages */
+                }
+
+                if (size <= 3) {
+                    SchwungJackMidiMsg r;
+                    r.channel = data[0] & 0x0F;
+                    r.type = (data[0] & 0xF0) >> 4;
+                    r.data1 = size > 1 ? data[1] : 0;
+                    r.data2 = size > 2 ? data[2] : 0;
+
+                    if (data[0] == 0xF0) sysexActive = true;
+                    else if (sysexActive && (data[0] & 0x80) != 0 && data[0] != 0xF7)
+                        sysexActive = false;
+
+                    SchwungJackUsbMidiMsg m;
+                    m.cable = 0;
+                    m.cin = r.type;
+                    m.midi = r;
+
+                    if (sysexActive) {
+                        m.cin = 0x4; /* sysex continue */
+                        sysexActive = false;
+                        if (data[0] == 0xF7) m.cin = 0x5;
+                        else if (size > 1 && data[1] == 0xF7) m.cin = 0x6;
+                        else if (size > 2 && data[2] == 0xF7) m.cin = 0x7;
+                        else sysexActive = true;
+                    }
+
+                    fShm->midi_from_jack[count++] = m;
+                } else {
+                    /* Long sysex: fragment into 3-byte USB-MIDI packets */
+                    /* First packet */
+                    if (count < SCHWUNG_JACK_MIDI_OUT_MAX) {
+                        SchwungJackUsbMidiMsg m;
+                        m.cable = 0;
+                        m.cin = 0x4;
+                        m.midi.channel = data[0] & 0x0F;
+                        m.midi.type = (data[0] & 0xF0) >> 4;
+                        m.midi.data1 = data[1];
+                        m.midi.data2 = data[2];
+                        fShm->midi_from_jack[count++] = m;
+                    }
+                    /* Remaining packets */
+                    for (size_t i = 3; i < size && count < SCHWUNG_JACK_MIDI_OUT_MAX; i += 3) {
+                        size_t len = std::min(size - i, (size_t)3);
+                        SchwungJackUsbMidiMsg m;
+                        m.cable = 0;
+                        m.midi.channel = data[i] & 0x0F;
+                        m.midi.type = (data[i] & 0xF0) >> 4;
+                        m.midi.data1 = len > 1 ? data[i + 1] : 0;
+                        m.midi.data2 = len > 2 ? data[i + 2] : 0;
+
+                        uint8_t cin = 0x4;
+                        if (i + len >= size) { /* last packet */
+                            switch (len) {
+                                case 1: cin = 0x5; break;
+                                case 2: cin = 0x6; break;
+                                case 3: cin = (m.midi.data2 == 0xF7) ? 0x7 : 0x4; break;
+                            }
+                        }
+                        m.cin = cin;
+                        fShm->midi_from_jack[count++] = m;
+                    }
+                }
+            } while ((e = fMIDIReadQueue.DequeueEvent()));
+
+            fShm->midi_from_jack_count = count;
+        }
+    }
+    /* External MIDI — simpler, no channel filter */
+    {
+        jack_midi_event_t *first = fExternalMIDIReadQueue.DequeueEvent();
+        if (first) {
+            int count = 0;
+            jack_midi_event_t *e = first;
+            do {
+                if (!e || e->size == 0 || e->size > 3) continue;
+                if (count >= SCHWUNG_JACK_MIDI_OUT_MAX) break;
+                uint8_t *data = e->buffer;
+                SchwungJackUsbMidiMsg m;
+                m.cable = 2;
+                m.cin = (data[0] >> 4) & 0x0F;
+                m.midi.channel = data[0] & 0x0F;
+                m.midi.type = (data[0] >> 4) & 0x0F;
+                m.midi.data1 = e->size > 1 ? data[1] : 0;
+                m.midi.data2 = e->size > 2 ? data[2] : 0;
+                fShm->ext_midi_from_jack[count++] = m;
+            } while ((e = fExternalMIDIReadQueue.DequeueEvent()));
+            fShm->ext_midi_from_jack_count = count;
+        }
+    }
+
+    /* Audio: copy previous cycle's output to shm */
+    int16_t* audio_out = fShm->audio_out;
+    for (int i = 0; i < SCHWUNG_JACK_AUDIO_FRAMES; i++) {
+        audio_out[i * 2]     = toint(fOutputBuffer[0][i]);
+        audio_out[i * 2 + 1] = toint(fOutputBuffer[1][i]);
+    }
+
+    /* Signal completion of output for this frame */
+    fShm->jack_frame_done = fLastFrameCounter;
+
+    /* Block until shim signals next frame */
     struct timespec timeout;
     timeout.tv_sec = 0;
-    timeout.tv_nsec = 10000000; // 10ms
+    timeout.tv_nsec = 10000000; // 10ms timeout
 
-    uint32_t expected = fLastFrameCounter;
-    futex_wait(&fShm->frame_counter, expected, &timeout);
+    futex_wait(&fShm->frame_counter, fLastFrameCounter, &timeout);
     fLastFrameCounter = fShm->frame_counter;
 
     JackDriver::CycleTakeBeginTime();
-    auto r = JackAudioDriver::Process();
+    int r = JackAudioDriver::Process();
     JackDriver::CycleTakeEndTime();
-
-    // Signal completion
-    fShm->jack_frame_done = fShm->frame_counter;
 
     return r;
 }
 
+/* ---- Read: shm → JACK port buffers ---- */
+
 int JackShadowDriver::Read()
 {
-    // Deinterleave int16 audio from shared memory into float input buffers
+    if (!fShm) return -1;
+
+    /* Audio: deinterleave int16 → float */
     const int16_t* audio_in = fShm->audio_in;
     for (int i = 0; i < SCHWUNG_JACK_AUDIO_FRAMES; i++) {
         fInputBuffer[0][i] = fromint(audio_in[i * 2]);
         fInputBuffer[1][i] = fromint(audio_in[i * 2 + 1]);
     }
-
-    // Copy float input buffers to JACK capture ports
-    assert(fCaptureChannels == 2);
     for (int i = 0; i < fCaptureChannels; i++) {
-        memcpy(GetInputBuffer(i), fInputBuffer[i], sizeof(jack_default_audio_sample_t) * fEngineControl->fBufferSize);
+        memcpy(GetInputBuffer(i), fInputBuffer[i],
+               sizeof(jack_default_audio_sample_t) * fEngineControl->fBufferSize);
     }
 
-    // Process MIDI from shm -> JACK capture (cable 0, rewrite to channel 16)
+    /* MIDI capture cable 0 */
     {
-        JackMidiBuffer * captureBuffer = reinterpret_cast<JackMidiBuffer *>(fGraphManager->GetBuffer(fMIDICaptureId, fEngineControl->fBufferSize));
-        JackMidiBufferWriteQueue writeQueue;
-        writeQueue.ResetMidiBuffer(captureBuffer, fEngineControl->fBufferSize);
+        JackMidiBuffer *buf = reinterpret_cast<JackMidiBuffer *>(
+            fGraphManager->GetBuffer(fMIDICaptureId, fEngineControl->fBufferSize));
+        JackMidiBufferWriteQueue wq;
+        wq.ResetMidiBuffer(buf, fEngineControl->fBufferSize);
 
-        for (uint8_t idx = 0; idx < fShm->midi_to_jack_count; idx++) {
-            const auto& event = fShm->midi_to_jack[idx];
-            const auto& midi = event.message.midi;
+        uint8_t count = fShm->midi_to_jack_count;
+        for (uint8_t i = 0; i < count; i++) {
+            auto &ev = fShm->midi_to_jack[i];
+            auto &midi = ev.message.midi;
 
-            std::array<uint8_t, 3> data = {
-                static_cast<uint8_t>(midi.channel | (midi.type << 4)),
-                midi.data1,
-                midi.data2
-            };
+            /* Rewrite cable 0 to channel 16 (same as JackMoveDriver) */
+            uint8_t data[3];
+            switch (midi.type) {
+                case 0x8: case 0x9: case 0xA: case 0xB: case 0xC: case 0xD: case 0xE:
+                    data[0] = static_cast<uint8_t>(15 | (midi.type << 4));
+                    break;
+                default:
+                    data[0] = static_cast<uint8_t>((midi.type << 4) | midi.channel);
+                    break;
+            }
+            data[1] = midi.data1;
+            data[2] = midi.data2;
 
             size_t size = 3;
-            switch (event.message.cin) {
+            switch (ev.message.cin) {
                 case 0x5: case 0xF: size = 1; break;
                 case 0x2: case 0x6: case 0xC: case 0xD: size = 2; break;
-                case 0x3: case 0x4: case 0x8: case 0x9: case 0xA: case 0xB: case 0xE: size = 3; break;
-                default: continue;
+                default: break;
             }
 
-            // Rewrite cable 0 events to channel 16
-            if (event.message.cable == 0) {
-                switch (midi.type) {
-                    case 0x8: case 0x9: case 0xB: case 0xA: case 0xC: case 0xD: case 0xE:
-                        data[0] = static_cast<uint8_t>(15 | (midi.type << 4));
-                        break;
-                    default:
-                        break;
-                }
-            }
-
-            fMIDIWriteQueue.EnqueueEvent(event.timestamp, size, data.data());
-        }
-
-        while (auto e = fMIDIWriteQueue.DequeueEvent()) {
-            writeQueue.EnqueueEvent(e);
+            jack_midi_event_t e;
+            e.time = 0; /* all events at start of buffer */
+            e.size = size;
+            e.buffer = data;
+            wq.EnqueueEvent(&e);
         }
     }
 
-    // Process external MIDI from shm -> JACK ext capture
+    /* MIDI capture external */
     {
-        JackMidiBuffer * captureBuffer = reinterpret_cast<JackMidiBuffer *>(fGraphManager->GetBuffer(fExternalMIDICaptureId, fEngineControl->fBufferSize));
-        JackMidiBufferWriteQueue writeQueue;
-        writeQueue.ResetMidiBuffer(captureBuffer, fEngineControl->fBufferSize);
+        JackMidiBuffer *buf = reinterpret_cast<JackMidiBuffer *>(
+            fGraphManager->GetBuffer(fExternalMIDICaptureId, fEngineControl->fBufferSize));
+        JackMidiBufferWriteQueue wq;
+        wq.ResetMidiBuffer(buf, fEngineControl->fBufferSize);
 
-        for (uint8_t idx = 0; idx < fShm->ext_midi_to_jack_count; idx++) {
-            const auto& event = fShm->ext_midi_to_jack[idx];
-            const auto& midi = event.message.midi;
+        uint8_t count = fShm->ext_midi_to_jack_count;
+        for (uint8_t i = 0; i < count; i++) {
+            auto &ev = fShm->ext_midi_to_jack[i];
+            auto &midi = ev.message.midi;
 
-            std::array<uint8_t, 3> data = {
-                static_cast<uint8_t>(midi.channel | (midi.type << 4)),
-                midi.data1,
-                midi.data2
+            uint8_t data[3] = {
+                static_cast<uint8_t>((midi.type << 4) | midi.channel),
+                midi.data1, midi.data2
             };
-
             size_t size = 3;
-            switch (event.message.cin) {
+            switch (ev.message.cin) {
                 case 0x5: case 0xF: size = 1; break;
                 case 0x2: case 0x6: case 0xC: case 0xD: size = 2; break;
-                case 0x3: case 0x4: case 0x8: case 0x9: case 0xA: case 0xB: case 0xE: size = 3; break;
-                default: continue;
+                default: break;
             }
 
-            fExternalMIDIWriteQueue.EnqueueEvent(event.timestamp, size, data.data());
-        }
-
-        while (auto e = fExternalMIDIWriteQueue.DequeueEvent()) {
-            writeQueue.EnqueueEvent(e);
+            jack_midi_event_t e;
+            e.time = 0;
+            e.size = size;
+            e.buffer = data;
+            wq.EnqueueEvent(&e);
         }
     }
 
-    // Read display port and copy to shared memory
+    /* Display: read from system:display port, write to shm */
     {
-        JackMidiBuffer * displayBuffer = reinterpret_cast<JackMidiBuffer *>(fGraphManager->GetBuffer(fDisplayId, fEngineControl->fBufferSize));
-        JackMidiBufferReadQueue readQueue;
-        readQueue.ResetMidiBuffer(displayBuffer);
-        while (auto e = readQueue.DequeueEvent()) {
-            if (e->size == SHADOW_DISPLAY_DATA_LEN) {
-                // Strip "MOVEDISP" header, copy 1024 bytes of display data
-                memcpy(fShm->display_data, e->buffer + SHADOW_DISPLAY_HEADER_LEN, SCHWUNG_JACK_DISPLAY_SIZE);
-                fShm->display_active = 1;
+        JackMidiBuffer *buf = reinterpret_cast<JackMidiBuffer *>(
+            fGraphManager->GetBuffer(fDisplayId, fEngineControl->fBufferSize));
+        JackMidiBufferReadQueue rq;
+        rq.ResetMidiBuffer(buf);
+        while (auto e = rq.DequeueEvent()) {
+            if (e->size == DISPLAY_DATA_LEN) {
+                memcpy(fShm->display_data, e->buffer + DISPLAY_HEADER_LEN,
+                       SCHWUNG_JACK_DISPLAY_SIZE);
             }
         }
     }
@@ -393,162 +470,79 @@ int JackShadowDriver::Read()
     return 0;
 }
 
+/* ---- Write: JACK port buffers → async queues ----
+ * Matches JackMoveDriver::Write() pattern: read playback buffers into
+ * async queues. Process() drains them to shm on the next cycle.
+ */
 int JackShadowDriver::Write()
 {
-    // Read JACK playback ports into float output buffers
-    assert(fPlaybackChannels == 2);
+    if (!fShm) return -1;
+
+    /* MIDI: read playback buffers → async queues (drained in Process()) */
+    {
+        JackMidiBuffer *buf = reinterpret_cast<JackMidiBuffer *>(
+            fGraphManager->GetBuffer(fMIDIPlaybackId, fEngineControl->fBufferSize));
+        JackMidiBufferReadQueue rq;
+        rq.ResetMidiBuffer(buf);
+        while (auto e = rq.DequeueEvent()) {
+            fMIDIReadQueue.EnqueueEvent(e);
+        }
+    }
+    {
+        JackMidiBuffer *buf = reinterpret_cast<JackMidiBuffer *>(
+            fGraphManager->GetBuffer(fExternalMIDIPlaybackId, fEngineControl->fBufferSize));
+        JackMidiBufferReadQueue rq;
+        rq.ResetMidiBuffer(buf);
+        while (auto e = rq.DequeueEvent()) {
+            fExternalMIDIReadQueue.EnqueueEvent(e);
+        }
+    }
+
+    /* Audio: copy output buffers (converted to shm in Process()) */
     for (int i = 0; i < fPlaybackChannels; i++) {
-        memcpy(fOutputBuffer[i], GetOutputBuffer(i), sizeof(jack_default_audio_sample_t) * fEngineControl->fBufferSize);
-    }
-
-    // Interleave float output buffers to int16 in shared memory
-    int16_t* audio_out = fShm->audio_out;
-    for (int i = 0; i < SCHWUNG_JACK_AUDIO_FRAMES; i++) {
-        audio_out[i * 2] = toint(fOutputBuffer[0][i]);
-        audio_out[i * 2 + 1] = toint(fOutputBuffer[1][i]);
-    }
-
-    // Read JACK MIDI playback -> shm midi_from_jack (cable 0, ch16 only)
-    {
-        JackMidiBuffer * playbackBuffer = reinterpret_cast<JackMidiBuffer *>(fGraphManager->GetBuffer(fMIDIPlaybackId, fEngineControl->fBufferSize));
-        JackMidiBufferReadQueue readQueue;
-        readQueue.ResetMidiBuffer(playbackBuffer);
-
-        uint8_t count = 0;
-        while (auto e = readQueue.DequeueEvent()) {
-            if (count >= SCHWUNG_JACK_MIDI_OUT_MAX) break;
-            if (e->size == 0 || e->size > 3) continue;
-
-            const uint8_t status = e->buffer[0];
-            const uint8_t chan = status & 0x0F;
-            const uint8_t masked = status & 0xF0;
-
-            // Filter: only channel 16 (index 15) for cable 0, plus sysex/reset
-            bool valid = false;
-            if ((masked == 0x80 || masked == 0x90 || masked == 0xB0) && chan == 15) {
-                valid = true;
-            } else if (status == 0xFF || status == 0xF0 || status == 0xF7 || (status & 0x80) == 0) {
-                valid = true;
-            }
-            if (!valid) continue;
-
-            SchwungJackMidiMsg midi;
-            midi.channel = e->buffer[0] & 0x0F;
-            midi.type = (e->buffer[0] & 0xF0) >> 4;
-            midi.data1 = e->size > 1 ? e->buffer[1] : 0;
-            midi.data2 = e->size > 2 ? e->buffer[2] : 0;
-
-            // Rewrite channel 16 back to channel 1 for cable 0
-            if (chan == 15) {
-                midi.channel = 0;
-            }
-
-            SchwungJackUsbMidiMsg usb;
-            usb.cable = 0;
-            usb.midi = midi;
-
-            // Determine CIN from message type
-            switch (e->size) {
-                case 1: usb.cin = 0x5; break;
-                case 2: usb.cin = (masked == 0xC0 || masked == 0xD0) ? 0xC : 0x6; break;
-                case 3: usb.cin = (midi.type & 0x08) ? midi.type : 0x4; break;
-                default: usb.cin = 0; break;
-            }
-
-            fShm->midi_from_jack[count++] = usb;
-        }
-        fShm->midi_from_jack_count = count;
-    }
-
-    // Read JACK external MIDI playback -> shm ext_midi_from_jack
-    {
-        JackMidiBuffer * playbackBuffer = reinterpret_cast<JackMidiBuffer *>(fGraphManager->GetBuffer(fExternalMIDIPlaybackId, fEngineControl->fBufferSize));
-        JackMidiBufferReadQueue readQueue;
-        readQueue.ResetMidiBuffer(playbackBuffer);
-
-        uint8_t count = 0;
-        while (auto e = readQueue.DequeueEvent()) {
-            if (count >= SCHWUNG_JACK_MIDI_OUT_MAX) break;
-            if (e->size == 0 || e->size > 3) continue;
-
-            SchwungJackMidiMsg midi;
-            midi.channel = e->buffer[0] & 0x0F;
-            midi.type = (e->buffer[0] & 0xF0) >> 4;
-            midi.data1 = e->size > 1 ? e->buffer[1] : 0;
-            midi.data2 = e->size > 2 ? e->buffer[2] : 0;
-
-            SchwungJackUsbMidiMsg usb;
-            usb.cable = 2;
-            usb.midi = midi;
-
-            switch (e->size) {
-                case 1: usb.cin = 0x5; break;
-                case 2: {
-                    uint8_t masked = e->buffer[0] & 0xF0;
-                    usb.cin = (masked == 0xC0 || masked == 0xD0) ? 0xC : 0x6;
-                    break;
-                }
-                case 3: usb.cin = (midi.type & 0x08) ? midi.type : 0x4; break;
-                default: usb.cin = 0; break;
-            }
-
-            fShm->ext_midi_from_jack[count++] = usb;
-        }
-        fShm->ext_midi_from_jack_count = count;
+        memcpy(fOutputBuffer[i], GetOutputBuffer(i),
+               sizeof(jack_default_audio_sample_t) * fEngineControl->fBufferSize);
     }
 
     return 0;
 }
 
-int JackShadowDriver::is_realtime() const
-{
-    return 1;
-}
+int JackShadowDriver::is_realtime() const { return 1; }
 
 } // end of namespace
 
 
+/* ---- Driver C entry points ---- */
 #ifdef __cplusplus
-extern "C"
-{
+extern "C" {
 #endif
 
-SERVER_EXPORT const jack_driver_desc_t* driver_get_descriptor ()
-{
-    jack_driver_desc_t * desc;
+SERVER_EXPORT const jack_driver_desc_t* driver_get_descriptor() {
+    jack_driver_desc_t *desc;
     jack_driver_desc_filler_t filler;
-
-    desc = jack_driver_descriptor_construct("shadow", JackDriverMaster, "Schwung shadow driver (shared memory with Move shim)", &filler);
-
+    desc = jack_driver_descriptor_construct("shadow",
+        JackDriverMaster,
+        "Schwung shadow driver (shared memory with Move shim)",
+        &filler);
     return desc;
 }
 
-static Jack::JackShadowDriver* g_shadow_driver = nullptr;
-
-SERVER_EXPORT Jack::JackDriverClientInterface* driver_initialize(Jack::JackLockedEngine* engine, Jack::JackSynchro* table, const JSList* params)
+SERVER_EXPORT Jack::JackDriverClientInterface* driver_initialize(
+    Jack::JackLockedEngine* engine, Jack::JackSynchro* table, const JSList* params)
 {
     jack_nframes_t nframes = SCHWUNG_JACK_AUDIO_FRAMES;
     jack_nframes_t samplerate = 44100;
-    bool capturing = true;
-    bool playing = true;
-    int inchannels = 2;
-    int outchannels = 2;
-    bool monitor = false;
-    const char* capture_driver_name = "shadow";
-    const char* playback_driver_name = "shadow";
 
-    jack_nframes_t capture_latency = 0;
-    jack_nframes_t playback_latency = 0;
+    auto *driver = new Jack::JackShadowDriver("system", "shadow", engine, table);
+    auto *threaded = new Jack::JackThreadedDriver(driver);
 
-    g_shadow_driver = new Jack::JackShadowDriver("system", "shadow", engine, table);
-    Jack::JackDriverClientInterface* threaded_driver = new Jack::JackThreadedDriver(g_shadow_driver);
-    if (g_shadow_driver->Open(nframes, samplerate, capturing, playing, inchannels, outchannels, monitor, capture_driver_name, playback_driver_name, capture_latency, playback_latency) == 0) {
-        return threaded_driver;
+    if (driver->Open(nframes, samplerate, true, true, 2, 2, false,
+                     "shadow", "shadow", 0, 0) == 0) {
+        return threaded;
     } else {
-        delete threaded_driver;
+        delete threaded;
         return NULL;
     }
-
 }
 
 #ifdef __cplusplus
