@@ -227,6 +227,7 @@ int JackShadowDriver::Process()
         jack_midi_event_t *first = fMIDIReadQueue.DequeueEvent();
         if (first) {
             int count = 0;
+            const int MAX_PER_CYCLE = 20; /* Match SPI hardware limit */
 
             /* Encode JACK MIDI → USB-MIDI, matching JackMoveDriver::provideMidi().
              * JACK splits sysex into 3-byte events. We must track sysex state
@@ -234,7 +235,7 @@ int JackShadowDriver::Process()
             jack_midi_event_t *e = first;
             do {
                 if (!e || e->size == 0) continue;
-                if (count >= SCHWUNG_JACK_MIDI_OUT_MAX) break;
+                if (count >= MAX_PER_CYCLE) break;  /* Leave rest in queue for next cycle */
 
                 uint8_t *data = e->buffer;
                 size_t size = e->size;
@@ -285,7 +286,7 @@ int JackShadowDriver::Process()
                     fShm->midi_from_jack[count++] = m;
                 } else {
                     /* Long sysex (>3 bytes): fragment */
-                    for (size_t i = 0; i < size && count < SCHWUNG_JACK_MIDI_OUT_MAX; i += 3) {
+                    for (size_t i = 0; i < size && count < MAX_PER_CYCLE; i += 3) {
                         size_t len = std::min(size - i, (size_t)3);
                         SchwungJackUsbMidiMsg m;
                         m.cable = 0;
@@ -317,10 +318,11 @@ int JackShadowDriver::Process()
         jack_midi_event_t *first = fExternalMIDIReadQueue.DequeueEvent();
         if (first) {
             int count = 0;
+            const int EXT_MAX = 20;
             jack_midi_event_t *e = first;
             do {
                 if (!e || e->size == 0 || e->size > 3) continue;
-                if (count >= SCHWUNG_JACK_MIDI_OUT_MAX) break;
+                if (count >= EXT_MAX) break;
                 uint8_t *data = e->buffer;
                 SchwungJackUsbMidiMsg m;
                 m.cable = 2;
