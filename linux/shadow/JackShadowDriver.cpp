@@ -225,7 +225,9 @@ int JackShadowDriver::Process()
      * - System messages (reset, sysex start/end) → pass through */
     {
         jack_midi_event_t *first = fMIDIReadQueue.DequeueEvent();
-        if (first) {
+        if (!first) {
+            fShm->midi_from_jack_count = 0;
+        } else {
             int count = 0;
             const int MAX_PER_CYCLE = 20; /* Match SPI hardware limit */
 
@@ -494,8 +496,20 @@ int JackShadowDriver::Write()
             fGraphManager->GetBuffer(fMIDIPlaybackId, fEngineControl->fBufferSize));
         JackMidiBufferReadQueue rq;
         rq.ResetMidiBuffer(buf);
+        int enqueued = 0, dropped = 0;
         while (auto e = rq.DequeueEvent()) {
-            fMIDIReadQueue.EnqueueEvent(e);
+            auto result = fMIDIReadQueue.EnqueueEvent(e);
+            if (result == JackMidiWriteQueue::OK) enqueued++;
+            else dropped++;
+        }
+        /* Debug counters at shm offsets 3904-3911 */
+        if (fShm) {
+            uint8_t *dbg = reinterpret_cast<uint8_t*>(fShm) + 3904;
+            /* Cumulative enqueued (32-bit LE) */
+            uint32_t *p_enq = reinterpret_cast<uint32_t*>(dbg);
+            uint32_t *p_drop = reinterpret_cast<uint32_t*>(dbg + 4);
+            *p_enq += enqueued;
+            *p_drop += dropped;
         }
     }
     {
