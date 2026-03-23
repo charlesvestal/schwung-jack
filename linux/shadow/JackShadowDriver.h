@@ -57,7 +57,10 @@ class JackShadowDriver : public JackAudioDriver
 
         jack_port_id_t fDisplayId;
 
-        JackMidiAsyncQueue fMIDIReadQueue;
+        /* Larger queue (16KB/4096 msgs) to absorb LED burst on startup.
+         * Default 4KB overflows when rnbomovecontrol sends all pad colors
+         * before the driver's Process() loop starts draining. */
+        JackMidiAsyncQueue fMIDIReadQueue{16384, 4096};
         JackMidiAsyncQueue fMIDIWriteQueue;
 
         JackMidiAsyncQueue fExternalMIDIReadQueue;
