@@ -231,12 +231,16 @@ int JackShadowDriver::Process()
 
             /* Encode JACK MIDI → USB-MIDI, matching JackMoveDriver::provideMidi().
              * JACK splits sysex into 3-byte events. We must track sysex state
-             * across events (not just within one event). */
+             * across events (not just within one event).
+             *
+             * Important: check count AFTER processing each event, BEFORE
+             * dequeuing the next. This avoids losing the event that was
+             * already dequeued by the while-condition. */
             jack_midi_event_t *e = first;
-            do {
-                if (!e || e->size == 0) continue;
-                if (count >= MAX_PER_CYCLE) break;  /* Leave rest in queue for next cycle */
+            for (;;) {
+                if (!e || e->size == 0) goto next_event;
 
+                {
                 uint8_t *data = e->buffer;
                 size_t size = e->size;
                 uint8_t status = data[0];
@@ -245,12 +249,12 @@ int JackShadowDriver::Process()
 
                 /* Filter: only pass ch16 channel msgs, sysex, system, and data bytes */
                 if ((masked == 0x80 || masked == 0x90 || masked == 0xB0)) {
-                    if (chan != 15) continue;
+                    if (chan != 15) goto next_event;
                     data[0] = masked; /* rewrite to ch0 */
                 } else if (status == 0xFF || status == 0xF0 || status == 0xF7 || (status & 0x80) == 0) {
                     /* sysex start/end, reset, or data continuation — pass through */
                 } else {
-                    continue;
+                    goto next_event;
                 }
 
                 if (size <= 3) {
@@ -283,10 +287,11 @@ int JackShadowDriver::Process()
                         m.cin = masked >> 4;
                     }
 
-                    fShm->midi_from_jack[count++] = m;
+                    if (count < SCHWUNG_JACK_MIDI_OUT_MAX)
+                        fShm->midi_from_jack[count++] = m;
                 } else {
                     /* Long sysex (>3 bytes): fragment */
-                    for (size_t i = 0; i < size && count < MAX_PER_CYCLE; i += 3) {
+                    for (size_t i = 0; i < size && count < SCHWUNG_JACK_MIDI_OUT_MAX; i += 3) {
                         size_t len = std::min(size - i, (size_t)3);
                         SchwungJackUsbMidiMsg m;
                         m.cable = 0;
@@ -308,7 +313,15 @@ int JackShadowDriver::Process()
                         fShm->midi_from_jack[count++] = m;
                     }
                 }
-            } while ((e = fMIDIReadQueue.DequeueEvent()));
+                }
+
+            next_event:
+                /* Stop dequeuing once we've filled the SPI limit.
+                 * Remaining events stay in the ringbuffer for next cycle. */
+                if (count >= MAX_PER_CYCLE) break;
+                e = fMIDIReadQueue.DequeueEvent();
+                if (!e) break;
+            }
 
             fShm->midi_from_jack_count = count;
         }
