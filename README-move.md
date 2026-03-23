@@ -39,9 +39,10 @@ export LD_LIBRARY_PATH=/data/UserData/rnbo/lib:$LD_LIBRARY_PATH
 jackd -d shadow
 ```
 
-### Building the shadow driver only
+### Building the shadow driver
 
 ```bash
+# Cross-compiles for ARM64 via Docker (builds image automatically on first run)
 ./scripts/build.sh
 # Output: build/jack_shadow.so
 ```
@@ -50,7 +51,7 @@ jackd -d shadow
 
 # Building the full JACK2 suite
 
-## building with a rnbo cloud compiler docker image, from jack2 dir
+## building with the rnbo cloud compiler docker image (for full JACK2, not just the shadow driver)
 
 ```
 docker pull registry.digitalocean.com/c74-private/rnbo.cloud-compiler-worker:2.6.0
