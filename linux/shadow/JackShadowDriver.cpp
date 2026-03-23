@@ -227,9 +227,10 @@ int JackShadowDriver::Process()
         jack_midi_event_t *first = fMIDIReadQueue.DequeueEvent();
         if (first) {
             int count = 0;
-            bool sysexActive = false;
 
-            /* Process first event, then drain rest */
+            /* Encode JACK MIDI → USB-MIDI, matching JackMoveDriver::provideMidi().
+             * JACK splits sysex into 3-byte events. We must track sysex state
+             * across events (not just within one event). */
             jack_midi_event_t *e = first;
             do {
                 if (!e || e->size == 0) continue;
@@ -241,57 +242,50 @@ int JackShadowDriver::Process()
                 uint8_t chan = status & 0x0F;
                 uint8_t masked = status & 0xF0;
 
-                /* Filter: only pass ch16, sysex, and system messages */
+                /* Filter: only pass ch16 channel msgs, sysex, system, and data bytes */
                 if ((masked == 0x80 || masked == 0x90 || masked == 0xB0)) {
-                    if (chan != 15) continue; /* skip non-ch16 */
-                    data[0] = masked; /* rewrite to channel 0 */
+                    if (chan != 15) continue;
+                    data[0] = masked; /* rewrite to ch0 */
                 } else if (status == 0xFF || status == 0xF0 || status == 0xF7 || (status & 0x80) == 0) {
-                    /* sysex, reset, continuation — pass through */
+                    /* sysex start/end, reset, or data continuation — pass through */
                 } else {
-                    continue; /* skip other messages */
+                    continue;
                 }
 
                 if (size <= 3) {
-                    SchwungJackMidiMsg r;
-                    r.channel = data[0] & 0x0F;
-                    r.type = (data[0] & 0xF0) >> 4;
-                    r.data1 = size > 1 ? data[1] : 0;
-                    r.data2 = size > 2 ? data[2] : 0;
-
-                    if (data[0] == 0xF0) sysexActive = true;
-                    else if (sysexActive && (data[0] & 0x80) != 0 && data[0] != 0xF7)
-                        sysexActive = false;
-
                     SchwungJackUsbMidiMsg m;
                     m.cable = 0;
-                    m.cin = r.type;
-                    m.midi = r;
+                    m.midi.channel = data[0] & 0x0F;
+                    m.midi.type = (data[0] & 0xF0) >> 4;
+                    m.midi.data1 = size > 1 ? data[1] : 0;
+                    m.midi.data2 = size > 2 ? data[2] : 0;
 
-                    if (sysexActive) {
-                        m.cin = 0x4; /* sysex continue */
-                        sysexActive = false;
-                        if (data[0] == 0xF7) m.cin = 0x5;
+                    /* Determine CIN based on sysex state (matching provideMidi) */
+                    if (data[0] == 0xF0) {
+                        /* Sysex start */
+                        m.cin = 0x4;
+                        if (size > 2 && data[2] == 0xF7) m.cin = 0x7;
                         else if (size > 1 && data[1] == 0xF7) m.cin = 0x6;
-                        else if (size > 2 && data[2] == 0xF7) m.cin = 0x7;
-                        else sysexActive = true;
+                        else if (size == 1 && data[0] == 0xF7) m.cin = 0x5;
+                    } else if (data[0] == 0xF7) {
+                        /* Sysex end (single byte) */
+                        m.cin = 0x5;
+                    } else if ((data[0] & 0x80) == 0) {
+                        /* Data bytes — sysex continuation */
+                        m.cin = 0x4;
+                        /* Check for F7 ending */
+                        if (size >= 3 && data[2] == 0xF7) m.cin = 0x7;
+                        else if (size >= 2 && data[1] == 0xF7) m.cin = 0x6;
+                        else if (data[0] == 0xF7) m.cin = 0x5;
+                    } else {
+                        /* Normal channel message */
+                        m.cin = masked >> 4;
                     }
 
                     fShm->midi_from_jack[count++] = m;
                 } else {
-                    /* Long sysex: fragment into 3-byte USB-MIDI packets */
-                    /* First packet */
-                    if (count < SCHWUNG_JACK_MIDI_OUT_MAX) {
-                        SchwungJackUsbMidiMsg m;
-                        m.cable = 0;
-                        m.cin = 0x4;
-                        m.midi.channel = data[0] & 0x0F;
-                        m.midi.type = (data[0] & 0xF0) >> 4;
-                        m.midi.data1 = data[1];
-                        m.midi.data2 = data[2];
-                        fShm->midi_from_jack[count++] = m;
-                    }
-                    /* Remaining packets */
-                    for (size_t i = 3; i < size && count < SCHWUNG_JACK_MIDI_OUT_MAX; i += 3) {
+                    /* Long sysex (>3 bytes): fragment */
+                    for (size_t i = 0; i < size && count < SCHWUNG_JACK_MIDI_OUT_MAX; i += 3) {
                         size_t len = std::min(size - i, (size_t)3);
                         SchwungJackUsbMidiMsg m;
                         m.cable = 0;
@@ -300,12 +294,13 @@ int JackShadowDriver::Process()
                         m.midi.data1 = len > 1 ? data[i + 1] : 0;
                         m.midi.data2 = len > 2 ? data[i + 2] : 0;
 
-                        uint8_t cin = 0x4;
-                        if (i + len >= size) { /* last packet */
+                        uint8_t cin = 0x4; /* sysex continue */
+                        if (i + len >= size) {
+                            /* Last packet */
                             switch (len) {
                                 case 1: cin = 0x5; break;
                                 case 2: cin = 0x6; break;
-                                case 3: cin = (m.midi.data2 == 0xF7) ? 0x7 : 0x4; break;
+                                case 3: cin = (data[i+2] == 0xF7) ? 0x7 : 0x4; break;
                             }
                         }
                         m.cin = cin;
