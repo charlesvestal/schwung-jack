@@ -605,7 +605,7 @@ def create_driver_obj(bld, **kw):
     driver = bld(
         features=['c', 'cxx', 'cshlib', 'cxxshlib'],
         defines=['HAVE_CONFIG_H', 'SERVER_SIDE'],
-        includes=['.', 'common', 'common/jack', 'linux/move/move-spi/include'], #TODO configure
+        includes=['.', 'common', 'common/jack', 'linux/move/move-spi/include', 'linux/shadow'], #TODO configure
         install_path='${ADDON_DIR}/',
         **kw)
 
@@ -712,6 +712,11 @@ def build_drivers(bld):
         'linux/move/move-spi/src/ablspi.c'
     ]
 
+    shadow_src = [
+        'common/memops.c',
+        'linux/shadow/JackShadowDriver.cpp',
+    ]
+
     oss_src = [
         'common/memops.c',
         'solaris/oss/JackOSSDriver.cpp'
@@ -764,6 +769,12 @@ def build_drivers(bld):
         target='move',
         source=move_src,
         use=['MOVE'])
+
+    create_driver_obj(
+        bld,
+        target='shadow',
+        source=shadow_src,
+        use=['RT'])
 
     # Create hardware driver objects. Lexically sorted after the conditional,
     # e.g. BUILD_DRIVER_ALSA.
