@@ -352,16 +352,6 @@ int JackShadowDriver::Process()
         }
     }
 
-    /* Audio: copy previous cycle's output to shm */
-    int16_t* audio_out = fShm->audio_out;
-    for (int i = 0; i < SCHWUNG_JACK_AUDIO_FRAMES; i++) {
-        audio_out[i * 2]     = toint(fOutputBuffer[0][i]);
-        audio_out[i * 2 + 1] = toint(fOutputBuffer[1][i]);
-    }
-
-    /* Signal completion of output for this frame */
-    fShm->jack_frame_done = fLastFrameCounter;
-
     /* Block until shim signals next frame */
     struct timespec timeout;
     timeout.tv_sec = 0;
@@ -369,6 +359,18 @@ int JackShadowDriver::Process()
 
     futex_wait(&fShm->frame_counter, fLastFrameCounter, &timeout);
     fLastFrameCounter = fShm->frame_counter;
+
+    /* Audio: write IMMEDIATELY after wake, before the graph runs.
+     * Then signal jack_frame_done so the bridge's busywait can proceed. */
+    {
+        int16_t* audio_out = fShm->audio_out;
+        for (int i = 0; i < SCHWUNG_JACK_AUDIO_FRAMES; i++) {
+            audio_out[i * 2]     = toint(fOutputBuffer[0][i]);
+            audio_out[i * 2 + 1] = toint(fOutputBuffer[1][i]);
+        }
+    }
+    __sync_synchronize();
+    fShm->jack_frame_done = fLastFrameCounter;
 
     JackDriver::CycleTakeBeginTime();
     int r = JackAudioDriver::Process();
