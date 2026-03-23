@@ -369,7 +369,9 @@ int JackShadowDriver::Process()
             audio_out[i * 2 + 1] = toint(fOutputBuffer[1][i]);
         }
     }
+    /* Signal audio is written — bridge_pre busywaits on this */
     __sync_synchronize();
+    *(volatile uint8_t *)(((uint8_t *)fShm) + 3940) = 1;
     fShm->jack_frame_done = fLastFrameCounter;
 
     JackDriver::CycleTakeBeginTime();
